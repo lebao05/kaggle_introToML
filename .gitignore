@@ -1,0 +1,11 @@
+test.csv
+train.csv
+./vscode
+__pycache__/
+sample_submission/data
+sample_submission/submission.csv
+
+23127321_23127325.zip
+23127321_23127325/
+submission_files/
+debus_outputs/
