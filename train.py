@@ -101,31 +101,50 @@ def greedy_decode(model, source, source_mask, tokenizer, max_len, device):
 # =========================
 # Validation
 # =========================
+import re
+
 def run_validation(model, val_loader, tokenizer, device, max_len=50):
     model.eval()
+    
+    # Simple regex to fix "word . " -> "word."
+    def clean_text(text):
+        return re.sub(r'\s+([,.:])', r'\1', text)
 
+    print("\n--- Running Validation ---")
     with torch.no_grad():
         for i, batch in enumerate(val_loader):
             encoder_input = batch["encoder_input"].to(device)
+            # The label is usually stored as token IDs in the batch
+            label_ids = batch["label"].squeeze(0).cpu().numpy() 
 
             encoder_mask = (encoder_input != tokenizer.token_to_id('[PAD]')).unsqueeze(1).unsqueeze(1)
 
+            # Generate prediction
             output = greedy_decode(
-                model,
-                encoder_input,
-                encoder_mask,
-                tokenizer,
-                max_len,
+                model, 
+                encoder_input, 
+                encoder_mask, 
+                tokenizer, 
+                max_len, 
                 device
             )
 
-            pred_text = tokenizer.decode(output.cpu().numpy())
+            # Decode both
+            raw_pred = tokenizer.decode(output.cpu().numpy())
+            raw_label = tokenizer.decode(label_ids)
 
-            print("=" * 50)
-            print("PRED:", pred_text)
+            # Apply punctuation standardization
+            pred_text = clean_text(raw_pred)
+            label_text = clean_text(raw_label)
 
-            if i == 2:
+            print("-" * 30)
+            print(f"SAMPLE {i+1}:")
+            print(f"EXPECTED: {label_text}")
+            print(f"PREDICTED: {pred_text}")
+
+            if i == 10: # Reduced to 10 for faster logging, change back to 20 if needed
                 break
+    print("--- End of Validation ---\n")
 
 
 # =========================

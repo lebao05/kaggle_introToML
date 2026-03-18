@@ -9,3 +9,6 @@ sample_submission/submission.csv
 23127321_23127325/
 submission_files/
 debus_outputs/
+debug_outputs/
+kaggle_weights/
+submit/
