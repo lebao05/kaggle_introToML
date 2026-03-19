@@ -1,24 +1,17 @@
 from pathlib import Path
-
 def get_config():
     return {
-        "datasource": "kaggle",   # ✅ ADD THIS
+        "model_name": "t5-small",   # pretrained model
 
-        "batch_size": 8,
-        "num_epochs": 40,
-        "lr": 1e-4,
-        "seq_len": 256,
-        "d_model": 512,
+        "batch_size": 4,
+        "num_epochs": 10,
+        "lr": 3e-4,
+        "max_len": 300,
 
         "train_file": "train.csv",
         "test_file": "test.csv",
 
-        "model_folder": "weights",
-        "model_basename": "kaggle_model_",
-        "preload": None,
-
-        "tokenizer_file": "tokenizer.json",
-        "experiment_name": "runs/kaggle"
+        "output_dir": "outputs"
     }
 
 def get_weights_file_path(config, epoch: str):

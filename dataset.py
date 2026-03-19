@@ -1,14 +1,11 @@
 import torch
 from torch.utils.data import Dataset
+
 class KaggleDataset(Dataset):
-    def __init__(self, df, tokenizer, seq_len):
+    def __init__(self, df, tokenizer, max_len):
         self.df = df
         self.tokenizer = tokenizer
-        self.seq_len = seq_len
-
-        self.sos = tokenizer.token_to_id("[SOS]")
-        self.eos = tokenizer.token_to_id("[EOS]")
-        self.pad = tokenizer.token_to_id("[PAD]")
+        self.max_len = max_len
 
     def __len__(self):
         return len(self.df)
@@ -16,39 +13,30 @@ class KaggleDataset(Dataset):
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
 
-        context = row["context"]
-        target = row["target"]
+        context = str(row["context"])
+        target = str(row["target"])
 
-        enc_tokens = self.tokenizer.encode(context).ids
-        dec_tokens = self.tokenizer.encode(target).ids
-
-        enc_pad = self.seq_len - len(enc_tokens) - 2
-        dec_pad = self.seq_len - len(dec_tokens) - 1
-
-        if enc_pad < 0 or dec_pad < 0:
-            enc_tokens = enc_tokens[:self.seq_len-2]
-            dec_tokens = dec_tokens[:self.seq_len-1]
-            enc_pad = 0
-            dec_pad = 0
-
-        encoder_input = torch.tensor(
-            [self.sos] + enc_tokens + [self.eos] + [self.pad]*enc_pad
+        source = self.tokenizer(
+            context,
+            max_length=self.max_len,
+            padding="max_length",
+            truncation=True,
+            return_tensors="pt"
         )
 
-        decoder_input = torch.tensor(
-            [self.sos] + dec_tokens + [self.pad]*dec_pad
+        target_enc = self.tokenizer(
+            target,
+            max_length=self.max_len,
+            padding="max_length",
+            truncation=True,
+            return_tensors="pt"
         )
 
-        label = torch.tensor(
-            dec_tokens + [self.eos] + [self.pad]*dec_pad
-        )
+        labels = target_enc["input_ids"]
+        labels[labels == self.tokenizer.pad_token_id] = -100
 
         return {
-            "encoder_input": encoder_input,
-            "decoder_input": decoder_input,
-            "label": label,
+            "input_ids": source["input_ids"].squeeze(0),
+            "attention_mask": source["attention_mask"].squeeze(0),
+            "labels": labels.squeeze(0)
         }
-    
-def causal_mask(size):
-    mask = torch.triu(torch.ones((1, size, size)), diagonal=1).type(torch.int)
-    return mask == 0
