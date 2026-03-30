@@ -32,10 +32,23 @@ def train():
         per_device_eval_batch_size=1,
         num_train_epochs=config["num_epochs"],
         learning_rate=config["lr"],
-        evaluation_strategy="epoch",
-        save_strategy="epoch",
+
+        evaluation_strategy="steps",      # 👈 more frequent eval
+        eval_steps=100,                   # 👈 evaluate every 100 steps
+
+        logging_strategy="steps",         # 👈 log during training
+        logging_steps=10,                 # 👈 log every 10 steps
         logging_dir="./logs",
-        fp16=True  # GPU speedup
+
+        save_strategy="steps",
+        save_steps=500,
+
+        report_to="tensorboard",          # 👈 enable TensorBoard
+
+        load_best_model_at_end=True,      # 👈 useful for debugging
+        metric_for_best_model="loss",
+
+        fp16=True
     )
 
     trainer = Trainer(
