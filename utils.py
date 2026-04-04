@@ -1,223 +1,99 @@
-import re
+"""Utilities: text rendering and pixel conversion."""
+
 import os
-import torch
-import pandas as pd
+import sys
 import numpy as np
-from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont
-from config import get_config
-
-# Hugging Face
-from transformers import T5ForConditionalGeneration, T5Tokenizer
 
 
-# =========================
-# 1. Load Model & Tokenizer
-# =========================
-def load_model(config, device):
-    # ✅ tokenizer from original model (SAFE)
-    tokenizer = T5Tokenizer.from_pretrained(config["model_name"])
+# ============================================================
+# Text Rendering
+# ============================================================
 
-    # ✅ find latest checkpoint
-    checkpoints = [
-        os.path.join(config["output_dir"], d)
-        for d in os.listdir(config["output_dir"])
-        if d.startswith("checkpoint-")
-    ]
-
-    if len(checkpoints) == 0:
-        raise ValueError("❌ No checkpoints found in output_dir")
-
-    latest_checkpoint = sorted(
-        checkpoints, key=lambda x: int(x.split("-")[-1])
-    )[-1]
-
-    print(f"🔥 Loading checkpoint: {latest_checkpoint}")
-
-    model = T5ForConditionalGeneration.from_pretrained(latest_checkpoint).to(device)
-    model.eval()
-
-    return model, tokenizer
-
-
-# =========================
-# 2. Inference + Ratio
-# =========================
-def predict_text(model, tokenizer, context, device, max_len):
-    inputs = tokenizer(
-        context,
-        return_tensors="pt",
-        padding=True,
-        truncation=True,
-        max_length=max_len
-    ).to(device)
-
-    with torch.no_grad():
-        outputs = model.generate(
-            input_ids=inputs["input_ids"],
-            attention_mask=inputs["attention_mask"],
-            max_length=max_len,
-            num_beams=4
-        )
-
-    output_ids = outputs[0]
-
-    raw_text = tokenizer.decode(output_ids, skip_special_tokens=True)
-
-    # clean punctuation spacing
-    clean_text = re.sub(r'\s+([,.:])', r'\1', raw_text)
-
-    # ✅ accurate lengths (ignore padding)
-    input_len = inputs["attention_mask"].sum().item()
-    output_len = (output_ids != tokenizer.pad_token_id).sum().item()
-
-    return clean_text, input_len, output_len
-
-
-# =========================
-# 3. Text Rendering
-# =========================
-def text_to_image(text, max_width):
-    img = Image.new("L", (max_width, 32), 0)
-    draw = ImageDraw.Draw(img)
-
-    if not text.strip():
-        text = "."
-
-    font_paths = [
-        "/usr/share/fonts/truetype/liberation/LiberationSerif-Regular.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf",
-        "times.ttf"
-    ]
-
-    font = None
+def _get_font(font_size=20):
+    """Try to load a serif font, fallback to default."""
+    if os.name == "nt":
+        font_paths = [
+            "C:/Windows/Fonts/times.ttf",
+            "C:/Windows/Fonts/arial.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSerif-Regular.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf",
+        ]
+    else:
+        font_paths = [
+            "/usr/share/fonts/truetype/liberation/LiberationSerif-Regular.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf",
+            "C:/Windows/Fonts/times.ttf",
+            "C:/Windows/Fonts/arial.ttf",
+        ]
     for path in font_paths:
-        try:
-            font = ImageFont.truetype(path, 14)
-            break
-        except:
-            continue
+        if os.path.exists(path):
+            return ImageFont.truetype(path, font_size)
+    return ImageFont.load_default()
 
-    if font is None:
-        font = ImageFont.load_default()
 
-    draw.text((0, 0), text, fill=255, font=font)
+def render_text_to_image(text, max_width, font_size=20, padding=10):
+    """Render text into a grayscale image with word wrapping.
+
+    Returns a PIL Image (mode "L") with white text on black background.
+    """
+    font = _get_font(font_size)
+
+    words = text.split(" ")
+    lines = []
+    current_line = ""
+    content_width = max_width - 2 * padding
+
+    for word in words:
+        test = f"{current_line} {word}".strip()
+        bbox = font.getbbox(test)
+        w = bbox[2] - bbox[0]
+        if w <= content_width:
+            current_line = test
+        else:
+            if current_line:
+                lines.append(current_line)
+            current_line = word
+    if current_line:
+        lines.append(current_line)
+
+    if not lines:
+        lines = ["."]
+
+    line_height = font_size + 4
+    img_height = len(lines) * line_height + 2 * padding
+
+    img = Image.new("L", (max_width, img_height), 0)
+    draw = ImageDraw.Draw(img)
+    y = padding
+    for line in lines:
+        draw.text((padding, y), line, fill=255, font=font)
+        y += line_height
+
     return img
 
 
-# =========================
-# 4. Generate Submission
-# =========================
-def generate_submission():
-    config = get_config()
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+def render_target_to_image(text, max_width, font_size=20, padding=10):
+    """Render target text to image."""
+    return render_text_to_image(text, max_width, font_size, padding)
 
-    print(f"Running inference on: {device}")
 
-    model, tokenizer = load_model(config, device)
-    df = pd.read_csv(config["test_file"])
+# ============================================================
+# Pixel Conversion
+# ============================================================
 
-    debug_path = Path("debug_outputs")
-    debug_path.mkdir(parents=True, exist_ok=True)
+def image_to_pixels(img, sample_id, threshold=127):
+    """Convert a PIL image to pixel coordinates (sample_id, row, col)."""
+    arr = np.array(img)
+    rows, cols = np.where(arr > threshold)
 
-    pixel_data_list = []
-
-    # ✅ store ratios
-    ratios = []
-
-    for i, row in df.iterrows():
-        sample_id = int(row["id"])
-        max_width = int(row["max_width"])
-
-        # =========================
-        # 1. Prediction
-        # =========================
-        pred_text, input_len, output_len = predict_text(
-            model,
-            tokenizer,
-            str(row["context"]),
-            device,
-            config["max_len"]
+    if len(rows) == 0:
+        print(
+            f"[WARN] Blank rendered prediction for sample_id={sample_id}; "
+            "fallback pixel (0,0) inserted.",
+            file=sys.stderr,
         )
+        return np.array([[sample_id, 0, 0]], dtype=np.int64)
 
-        # ✅ compute ratio
-        ratio = output_len / (input_len + output_len + 1e-8)
-        ratios.append(ratio)
-
-        # =========================
-        # 2. Rendering
-        # =========================
-        img = text_to_image(pred_text, max_width)
-
-        # =========================
-        # 3. Pixels
-        # =========================
-        arr = np.array(img)
-        rows, cols = np.where(arr > 127)
-
-        if len(rows) > 0:
-            s_ids = np.full(len(rows), sample_id, dtype=np.int64)
-            pixel_block = np.stack(
-                [s_ids, rows.astype(np.int64), cols.astype(np.int64)], axis=1
-            )
-            pixel_data_list.append(pixel_block)
-        else:
-            pixel_data_list.append(
-                np.array([[sample_id, 0, 0]], dtype=np.int64)
-            )
-
-        # =========================
-        # Debug print
-        # =========================
-        if i % 20 == 0:
-            print(
-                f"[{i}/{len(df)}] ID {sample_id} | "
-                f"ratio={ratio:.4f} | "
-                f"in={input_len} out={output_len} | "
-                f"text={pred_text}"
-            )
-            img.save(debug_path / f"sample_{sample_id}_idx_{i}.png")
-
-    # =========================
-    # Combine pixels
-    # =========================
-    all_pixels = np.concatenate(pixel_data_list, axis=0)
-
-    pixels_array = np.zeros(len(all_pixels), dtype=[
-        ('sample_id', np.int64),
-        ('row_id', np.int64),
-        ('col_id', np.int64)
-    ])
-
-    pixels_array['sample_id'] = all_pixels[:, 0]
-    pixels_array['row_id'] = all_pixels[:, 1]
-    pixels_array['col_id'] = all_pixels[:, 2]
-
-    Path("data").mkdir(parents=True, exist_ok=True)
-    np.savez("data/pixels.npz", pixels=pixels_array)
-
-    print("✅ Exported: data/pixels.npz")
-
-    submission_df = pd.DataFrame({
-        "id": df["id"].values,
-        "sample_id": df["id"].values
-    })
-
-    submission_df.to_csv("submission.csv", index=False)
-
-    print("✅ Exported: submission.csv")
-
-    # =========================
-    # Final stats
-    # =========================
-    avg_ratio = sum(ratios) / len(ratios)
-
-    print(f"\n🔥 Average ratio (output / (input + output)): {avg_ratio:.4f}")
-    print(f"Total white pixels: {len(pixels_array)}")
-
-
-# =========================
-# Run
-# =========================
-if __name__ == "__main__":
-    generate_submission()
+    s_ids = np.full(len(rows), sample_id, dtype=np.int64)
+    return np.stack([s_ids, rows.astype(np.int64), cols.astype(np.int64)], axis=1)
