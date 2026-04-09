@@ -1,5 +1,5 @@
 test.csv
-train.csv
+train-3.csv
 ./vscode
 __pycache__/
 sample_submission/data
@@ -13,3 +13,5 @@ debug_outputs/
 kaggle_weights/
 submit/
 train-3
+outputs/
+session_notes.md

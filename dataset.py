@@ -1,104 +1,97 @@
-"""Dataset for stage-2 continuation LM in an OCR -> LM pipeline."""
+"""Dataset: context string → rendered image → TrOCR pixel_values tensor.
 
-import random
+Pipeline mỗi sample:
+  1. (Train) Fix mid-word split: 86% samples bị cắt giữa từ theo EDA
+  2. Render context text → ảnh grayscale (PIL)
+  3. Pad về hình vuông (giữ mode) → convert RGB
+  4. TrOCR processor → pixel_values (3, 384, 384)
+  5. (Train) mT5 tokenizer → labels
+"""
+
 import torch
+from PIL import Image
 from torch.utils.data import Dataset
+from utils import render_text_to_image
 
 
 def _clean_split(context: str, target: str, window_frac: float = 0.05):
-    full = context + target
-    original_split = len(context)
-    n = len(full)
+    """Dời boundary về whitespace gần nhất để tránh cắt giữa từ."""
+    full  = context + target
+    split = len(context)
+    n     = len(full)
     window = max(15, int(n * window_frac))
-    lo = max(1, original_split - window)
-    hi = min(n, original_split + window)
+    lo = max(1, split - window)
+    hi = min(n, split + window)
     spaces = [i for i in range(lo, hi) if full[i] == " "]
     if not spaces:
         return context, target
-    best = min(spaces, key=lambda i: abs(i - original_split))
-    new_context = full[:best]
-    new_target = full[best + 1:]
-    if not new_context.strip() or not new_target.strip():
+    best    = min(spaces, key=lambda i: abs(i - split))
+    new_ctx = full[:best].rstrip()
+    new_tgt = full[best + 1:].lstrip()
+    if not new_ctx or not new_tgt:
         return context, target
-    return new_context.rstrip(), new_target.lstrip()
+    return new_ctx, new_tgt
 
 
-def _inject_ocr_noise(text: str, cfg: dict) -> str:
-    if not text or random.random() > cfg.get("train_context_noise_prob", 0.0):
-        return text
-
-    words = text.split()
-    kept = []
-    for w in words:
-        if len(words) > 6 and random.random() < cfg.get("train_word_drop_prob", 0.0):
-            continue
-        chars = []
-        for ch in w:
-            if ch != " " and random.random() < cfg.get("train_char_drop_prob", 0.0):
-                continue
-            chars.append(ch)
-        kept.append("".join(chars) or w)
-    noisy = " ".join(kept).strip() or text
-    if random.random() < cfg.get("train_space_noise_prob", 0.0):
-        noisy = noisy.replace(" ", "", max(1, noisy.count(" ") // 6))
-    return noisy
-
-
-def build_lm_input(language: str, context_text: str, max_width: int) -> str:
-    width_bucket = int(round(max_width / 64.0) * 64)
-    return (
-        f"continue text\n"
-        f"language: {language}\n"
-        f"max_width: {width_bucket}\n"
-        f"context: {context_text}"
-    )
+def _pad_to_square(img: Image.Image) -> Image.Image:
+    """Pad ảnh về hình vuông, giữ nguyên mode (L / RGB)."""
+    w, h = img.size
+    s    = max(w, h)
+    out  = Image.new(img.mode, (s, s), 0)
+    out.paste(img, ((s - w) // 2, (s - h) // 2))
+    return out
 
 
 class PixelTextDataset(Dataset):
-    def __init__(self, df, tokenizer, config, is_test: bool = False):
-        self.df = df.reset_index(drop=True)
-        self.tokenizer = tokenizer
-        self.config = config
-        self.is_test = is_test
+    def __init__(self, df, trocr_processor, mt5_tokenizer, config, is_test=False):
+        self.df            = df.reset_index(drop=True)
+        self.processor     = trocr_processor   # xử lý ảnh → pixel_values
+        self.tokenizer     = mt5_tokenizer      # tokenize target text
+        self.cfg           = config
+        self.is_test       = is_test
 
     def __len__(self):
         return len(self.df)
 
     def __getitem__(self, idx):
-        row = self.df.iloc[idx]
-        language = str(row["language"])
-        context = str(row["context"])
+        row       = self.df.iloc[idx]
+        context   = str(row["context"])
         max_width = int(row["max_width"])
 
+        # ── 1. Fix word boundary ──────────────────────────────────────────────
         if not self.is_test:
-            target = str(row["target"])
+            target          = str(row["target"])
             context, target = _clean_split(context, target)
-            context = _inject_ocr_noise(context, self.config)
-        else:
-            target = None
 
-        source_text = build_lm_input(language, context, max_width)
-        src = self.tokenizer(
-            source_text,
-            max_length=self.config["max_source_len"],
-            truncation=True,
-            padding="max_length",
-            return_tensors="pt",
-        )
-        sample = {
-            "input_ids": src["input_ids"].squeeze(0),
-            "attention_mask": src["attention_mask"].squeeze(0),
-        }
+        # ── 2. Render context → ảnh grayscale ────────────────────────────────
+        img = render_text_to_image(
+            context, max_width,
+            font_size=self.cfg["font_size"],
+            padding=self.cfg["padding"],
+        )                                      # PIL mode "L"
 
+        # ── 3. Pad vuông → RGB ────────────────────────────────────────────────
+        img = _pad_to_square(img)              # vẫn mode "L", hình vuông
+        img = img.convert("RGB")               # → mode "RGB" (TrOCR cần 3 channel)
+
+        # ── 4. TrOCR processor → tensor ───────────────────────────────────────
+        # Resize về 384×384, normalize → (3, 384, 384)
+        pixel_values = self.processor(
+            images=img, return_tensors="pt"
+        )["pixel_values"].squeeze(0)
+
+        sample = {"pixel_values": pixel_values}
+
+        # ── 5. Tokenize target ────────────────────────────────────────────────
         if not self.is_test:
-            tgt = self.tokenizer(
-                text_target=target,
-                max_length=self.config["max_target_len"],
+            enc    = self.tokenizer(
+                target,
+                max_length=self.cfg["max_target_len"],
                 truncation=True,
                 padding="max_length",
                 return_tensors="pt",
             )
-            labels = tgt["input_ids"].squeeze(0).clone()
+            labels = enc["input_ids"].squeeze(0).clone()
             labels[labels == self.tokenizer.pad_token_id] = -100
             sample["labels"] = labels
 
