@@ -1,6 +1,6 @@
-"""Compatibility wrapper for the active pixel-decoder training pipeline."""
+"""Compatibility wrapper for the active LoRA text-render training pipeline."""
 
-from train_pixel import train as _pixel_train
+from train_lora import train as _pixel_train
 
 if __name__ == "__main__":
     _pixel_train()

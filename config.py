@@ -35,9 +35,14 @@ def get_config():
         "output_w": 384,   # columns (base width; scaled at inference)
 
         # ── Pixel decoder architecture ────────────────────────────────────────
-        "lang_emb_dim":    32,    # language conditioning embedding size
-        "decoder_hidden":  128,   # channels at start of ConvTranspose stack
-        "decoder_dropout": 0.15,  # dropout inside decoder
+        "lang_emb_dim":     32,   # language conditioning embedding size
+        "structure_hidden": 192,  # spatial channels before row decoding
+        "structure_grid_w": 96,   # intermediate width before final raster resize
+        "row_hidden":       256,  # GRU hidden size for row decoder
+        "row_layers":       2,
+        "col_hidden":       192,  # GRU hidden size for column decoder
+        "col_layers":       1,
+        "decoder_dropout":  0.15,
 
         # ── Training ──────────────────────────────────────────────────────────
         "epochs":       25,       # more epochs ok: decoder is small, low overfit risk
@@ -50,11 +55,17 @@ def get_config():
 
         # BCE loss weight for positive (white) pixels.
         # Text images are sparse: ~5-15% white pixels → upweight positives.
-        "pos_weight":   6.0,
+        "pos_weight":   2.5,
+        "loss_bce_weight":       1.0,
+        "loss_dice_weight":      0.7,
+        "loss_density_weight":   0.3,
+        "loss_projection_weight": 0.4,
+        "best_density_penalty":   0.75,
+        "best_projection_penalty": 0.50,
 
         # ── Eval & save ───────────────────────────────────────────────────────
         "eval_samples":             30,   # samples used for pixel-F1 eval
-        "best_min_f1":              0.0,  # save only if f1 > this
+        "best_min_score":           0.0,  # save only if score > this
         "early_stop_patience":      5,
         "early_stop_warmup_epochs": 3,
         "debug_image_count":        4,
@@ -68,4 +79,10 @@ def resolve_config(cfg: dict) -> dict:
     cfg["epochs"]     = int(max(1, cfg.get("epochs", 25)))
     cfg["output_h"]   = int(max(16, cfg.get("output_h", 96)))
     cfg["output_w"]   = int(max(16, cfg.get("output_w", 384)))
+    cfg["structure_hidden"] = int(max(32, cfg.get("structure_hidden", 192)))
+    cfg["structure_grid_w"] = int(max(8, cfg.get("structure_grid_w", 96)))
+    cfg["row_hidden"] = int(max(32, cfg.get("row_hidden", 256)))
+    cfg["row_layers"] = int(max(1, cfg.get("row_layers", 2)))
+    cfg["col_hidden"] = int(max(32, cfg.get("col_hidden", 192)))
+    cfg["col_layers"] = int(max(1, cfg.get("col_layers", 1)))
     return cfg

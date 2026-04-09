@@ -1,6 +1,6 @@
-"""Compatibility wrapper for the active pixel-decoder inference pipeline."""
+"""Compatibility wrapper for the active LoRA text-render inference pipeline."""
 
-from inference_pixel import generate_submission as _pixel_infer
+from inference_lora import generate_submission as _pixel_infer
 
 if __name__ == "__main__":
     _pixel_infer()
