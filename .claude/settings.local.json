@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip install:*)",
+      "Bash(where python:*)",
+      "Bash(pip3 --version)",
+      "Bash(python3 -m pip --version)",
+      "Bash(python -m pip --version)",
+      "Bash(/c/Users/Vanh/AppData/Local/Microsoft/WindowsApps/python3 -m pip --version)",
+      "Read(//c/Users/Vanh/AppData/Local/Programs/**)",
+      "Read(//c/Users/Vanh/anaconda3/**)",
+      "Read(//c/Users/Vanh/miniconda3/**)",
+      "Bash(/c/Users/Vanh/anaconda3/python.exe -m pip install torch torchvision transformers pillow pandas numpy)",
+      "Bash(python -c \"from transformers import AutoModelForVision2Seq\")",
+      "Bash(python3 -c \"from transformers import AutoModelForVision2Seq\")",
+      "Bash(pip3 show:*)"
+    ]
+  }
+}

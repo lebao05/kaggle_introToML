@@ -1,4 +1,10 @@
-"""Training: TrOCR encoder + Projection + mT5 decoder."""
+"""Compatibility wrapper for the active pixel-decoder training pipeline."""
+
+from train_pixel import train as _pixel_train
+
+if __name__ == "__main__":
+    _pixel_train()
+    raise SystemExit
 
 import json, os, random, time
 import numpy as np
@@ -6,34 +12,33 @@ import pandas as pd
 import torch
 import torch.nn as nn
 from pathlib import Path
-from torch.amp import autocast, GradScaler
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.utils.data import DataLoader
-from transformers import TrOCRProcessor, AutoTokenizer
+from transformers import AutoProcessor
 
-from config import get_config, resolve_config, LANG2ID
-from dataset import PixelTextDataset
-from model import TrOCRmT5Model
-from utils import render_text_to_image
+from config import get_config, resolve_config
+from dataset import PixelTextDataset, collate_fn, _clean_split, _render_rgb, build_chat
+from model import build_model
+from utils import get_lang_prompt
 
 
 # ── Seed ──────────────────────────────────────────────────────────────────────
 
-def set_seed(seed=42):
+def set_seed(seed: int = 42):
     random.seed(seed); np.random.seed(seed)
     torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
 
 
 # ── Data split ────────────────────────────────────────────────────────────────
 
-def stratified_split(df, col, frac, seed=42):
+def stratified_split(df, col: str, frac: float, seed: int = 42):
     val_parts = []
     for _, g in df.groupby(col, group_keys=False):
         n = max(1, int(round(len(g) * frac))) if len(g) > 1 else 1
         n = min(n, len(g) - 1) if len(g) > 1 else 1
         val_parts.append(g.sample(n=n, random_state=seed))
-    raw = pd.concat(val_parts)
+    raw   = pd.concat(val_parts)
     val   = raw.sample(frac=1, random_state=seed).reset_index(drop=True)
     train = df.drop(raw.index).sample(frac=1, random_state=seed).reset_index(drop=True)
     return train, val
@@ -46,23 +51,62 @@ def _cer(a: str, b: str) -> float:
     return (sum(x != y for x, y in zip(a, b)) + abs(len(a) - len(b))) / d
 
 
+# ── Eval generation ───────────────────────────────────────────────────────────
+
 @torch.no_grad()
-def generation_metrics(model, val_df, val_ds, tokenizer, config, device, n=60):
+def eval_generate(model, processor, val_df, config, device, n: int = 30) -> list[dict]:
+    """Generate predictions cho n val samples, tra ve records."""
     model.eval()
     records = []
-    for i in range(min(n, len(val_ds))):
-        s    = val_ds[i]
-        pv   = s["pixel_values"].unsqueeze(0).to(device)
-        pred = model.generate(pv, tokenizer, config)[0]
-        true_ids = s["labels"][s["labels"] != -100]
-        true = tokenizer.decode(true_ids, skip_special_tokens=True).strip()
+    tok = processor.tokenizer
+
+    for i in range(min(n, len(val_df))):
+        row       = val_df.iloc[i]
+        context   = str(row["context"])
+        target    = str(row["target"])
+        language  = str(row["language"])
+        max_width = int(row["max_width"])
+
+        context, target = _clean_split(context, target)
+        img = _render_rgb(context, max_width, config["font_size"], config["padding"])
+
+        messages, images = build_chat(img, language, target=None)
+        text = processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+        enc = processor(
+            text=text, images=images,
+            return_tensors="pt",
+            do_image_splitting=False,
+        )
+        enc = {k: v.to(device) for k, v in enc.items()}
+        prompt_len = enc["input_ids"].shape[1]
+
+        out = model.generate(
+            **enc,
+            max_new_tokens = config["max_new_tokens"],
+            min_new_tokens = config["min_new_tokens"],
+            do_sample      = False,
+            pad_token_id   = tok.pad_token_id,
+            eos_token_id   = tok.eos_token_id,
+        )
+        new_ids = out[0][prompt_len:]
+        pred = tok.decode(new_ids, skip_special_tokens=True).strip()
+
         records.append({
-            "lang": str(val_df.iloc[i]["language"]),
-            "cer":  _cer(pred, true),
+            "lang":     language,
+            "pred":     pred,
+            "true":     target,
+            "cer":      _cer(pred, target),
             "pred_len": len(pred),
-            "true_len": len(true),
-            "short": len(pred) < 0.2 * max(len(true), 1),
+            "true_len": len(target),
+            "short":    len(pred) < 0.2 * max(len(target), 1),
         })
+
+    return records
+
+
+def summarise_metrics(records: list[dict]) -> dict:
     if not records:
         return {}
     per_lang = {
@@ -78,49 +122,31 @@ def generation_metrics(model, val_df, val_ds, tokenizer, config, device, n=60):
     }
 
 
-def print_metrics(m):
-    if not m: return
+def print_metrics(m: dict):
+    if not m:
+        return
     print(f"  [Gen] CER={m['cer_mean']:.3f}  "
           f"pred={m['mean_pred_len']:.0f}/true={m['mean_true_len']:.0f}  "
           f"short={m['pct_too_short']:.1f}%")
     for lang, cer in m["cer_per_lang"].items():
-        print(f"    {lang:>10s}: {cer:.3f}{'  ⚠' if cer > 0.7 else ''}")
+        flag = "  !!!" if cer > 0.7 else ""
+        print(f"    {lang:>10s}: {cer:.3f}{flag}")
 
 
-@torch.no_grad()
-def sample_preds(model, val_df, val_ds, tokenizer, config, device, n=4):
-    model.eval()
-    rows = []
-    for i in range(min(n, len(val_ds))):
-        s    = val_ds[i]
-        pv   = s["pixel_values"].unsqueeze(0).to(device)
-        pred = model.generate(pv, tokenizer, config)[0]
-        true_ids = s["labels"][s["labels"] != -100]
-        true = tokenizer.decode(true_ids, skip_special_tokens=True).strip()
-        rows.append((str(val_df.iloc[i]["language"]), true, pred))
-    return rows
-
-
-def should_save_best(m, best_cer, config):
-    if not m: return False
-    if m["pct_too_short"] > config["best_max_short_pct"]: return False
+def should_save_best(m: dict, best_cer: float, config: dict) -> bool:
+    if not m:
+        return False
+    if m["pct_too_short"] > config["best_max_short_pct"]:
+        return False
     return m["cer_mean"] < best_cer
 
 
 # ── Optimizer ─────────────────────────────────────────────────────────────────
 
-def build_optimizer(model, config, total_steps):
-    """3 param groups với LR riêng: encoder (thấp) / proj / decoder (cao)."""
-    enc_p  = [p for n, p in model.named_parameters() if "encoder" in n and p.requires_grad]
-    dec_p  = [p for n, p in model.named_parameters() if ("decoder" in n or "lm_head" in n) and p.requires_grad]
-    proj_p = [p for n, p in model.named_parameters()
-              if not any(k in n for k in ("encoder", "decoder", "lm_head")) and p.requires_grad]
-
-    opt = AdamW([
-        {"params": enc_p,  "lr": config["enc_lr"]},
-        {"params": dec_p,  "lr": config["dec_lr"]},
-        {"params": proj_p, "lr": config["proj_lr"]},
-    ], weight_decay=config["weight_decay"])
+def build_optimizer(model, config: dict, total_steps: int):
+    """Chi optimize LoRA params (requires_grad=True)."""
+    lora_params = [p for p in model.parameters() if p.requires_grad]
+    opt = AdamW(lora_params, lr=config["lr"], weight_decay=config["weight_decay"])
 
     warmup = max(1, int(total_steps * config["warmup_ratio"]))
     decay  = max(1, total_steps - warmup)
@@ -133,56 +159,68 @@ def build_optimizer(model, config, total_steps):
 
 # ── Epoch ─────────────────────────────────────────────────────────────────────
 
-def run_epoch(model, loader, optimizer, scheduler, scaler,
-              config, device, tag, train_mode):
+def run_epoch(model, loader, optimizer, scheduler,
+              config: dict, device, tag: str, train_mode: bool) -> float:
     model.train() if train_mode else model.eval()
-    patch_drop = config["enc_patch_drop"] if train_mode else 0.0
-    use_amp    = bool(config.get("fp16") and device.type == "cuda")
-    losses     = []
-    ctx        = torch.enable_grad if train_mode else torch.no_grad
+    # bfloat16 khong can GradScaler (khac voi fp16)
+    use_bf16 = bool(config.get("bf16") and device.type == "cuda")
+    losses   = []
+    ctx      = torch.enable_grad if train_mode else torch.no_grad
 
     with ctx():
         for bi, batch in enumerate(loader):
-            pv = batch["pixel_values"].to(device)
-            lb = batch["labels"].to(device)
+            input_ids      = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            pixel_values   = batch["pixel_values"].to(device)
+            labels         = batch["labels"].to(device)
 
             if train_mode:
                 optimizer.zero_grad(set_to_none=True)
 
-            with autocast(device_type="cuda", enabled=use_amp):
-                loss = model(pv, lb, patch_drop=patch_drop)
+            # SmolVLM forward: tinh loss tu causal LM objective
+            # labels da mask prompt tokens = -100, chi tinh loss tren response
+            with torch.autocast(device_type="cuda",
+                                dtype=torch.bfloat16 if use_bf16 else torch.float32,
+                                enabled=use_bf16):
+                out = model(
+                    input_ids      = input_ids,
+                    attention_mask = attention_mask,
+                    pixel_values   = pixel_values,
+                    labels         = labels,
+                )
+                loss = out.loss
 
             if not torch.isfinite(loss):
                 print(f"  [{tag}] non-finite loss batch {bi}, skip")
                 continue
 
             if train_mode:
-                if use_amp and scaler:
-                    scaler.scale(loss).backward()
-                    scaler.unscale_(optimizer)
-                    nn.utils.clip_grad_norm_(model.parameters(), config["grad_clip"])
-                    scaler.step(optimizer); scaler.update()
-                else:
-                    loss.backward()
-                    nn.utils.clip_grad_norm_(model.parameters(), config["grad_clip"])
-                    optimizer.step()
-                if scheduler: scheduler.step()
+                loss.backward()
+                nn.utils.clip_grad_norm_(
+                    [p for p in model.parameters() if p.requires_grad],
+                    config["grad_clip"],
+                )
+                optimizer.step()
+                if scheduler:
+                    scheduler.step()
 
             losses.append(loss.item())
             if train_mode and bi % 20 == 0:
-                lr = scheduler.get_last_lr()[-1] if scheduler else config["dec_lr"]
-                print(f"  [{tag}] B{bi:>3d}/{len(loader)} loss={loss.item():.4f} lr={lr:.2e}")
+                lr = scheduler.get_last_lr()[-1] if scheduler else config["lr"]
+                print(f"  [{tag}] B{bi:>3d}/{len(loader)} "
+                      f"loss={loss.item():.4f} lr={lr:.2e}")
 
     return float(np.mean(losses)) if losses else float("nan")
 
 
 # ── Save ──────────────────────────────────────────────────────────────────────
 
-def save(model, trocr_processor, mt5_tokenizer, config, save_dir):
+def save(model, processor, config: dict, save_dir: str):
+    """Luu LoRA adapter + processor + config."""
     os.makedirs(save_dir, exist_ok=True)
-    torch.save(model.state_dict(), os.path.join(save_dir, "model_weights.pt"))
-    trocr_processor.save_pretrained(save_dir)
-    mt5_tokenizer.save_pretrained(save_dir)
+    # Luu chi LoRA adapter (khong luu base weights)
+    model.save_pretrained(save_dir)
+    processor.save_pretrained(save_dir)
     with open(os.path.join(save_dir, "run_config.json"), "w", encoding="utf-8") as f:
         json.dump(config, f, ensure_ascii=False, indent=2)
 
@@ -193,28 +231,28 @@ def train():
     config = resolve_config(get_config())
     set_seed(42)
 
-    device  = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    use_amp = bool(config.get("fp16") and device.type == "cuda")
-    scaler  = GradScaler("cuda") if use_amp else None
-
-    os.makedirs(config["output_dir"], exist_ok=True)
-    os.makedirs(os.path.join(config["output_dir"], "checkpoints"), exist_ok=True)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     print("=" * 60)
-    print("TRAINING: TrOCR encoder + Projection + mT5 decoder")
+    print("TRAINING: SmolVLM-256M-Instruct + LoRA")
     print("=" * 60)
     print(f"  Device:  {device}")
-    print(f"  Encoder: {config['trocr_name']}")
-    print(f"  Decoder: {config['mt5_name']}")
-    print(f"  Epochs:  {config['epochs']}")
+    print(f"  Model:   {config['model_name']}")
+    print(f"  LoRA:    r={config['lora_r']} alpha={config['lora_alpha']}")
+    print(f"  Epochs:  {config['epochs']}  LR={config['lr']}")
 
-    # ── 1. Processors ─────────────────────────────────────────────────────────
-    print("\n[1/4] Loading processors...")
-    trocr_processor = TrOCRProcessor.from_pretrained(config["trocr_name"])
-    mt5_tokenizer   = AutoTokenizer.from_pretrained(config["mt5_name"])
-    print(f"  mT5 vocab_size={mt5_tokenizer.vocab_size}")
+    os.makedirs(config["output_dir"], exist_ok=True)
 
-    # ── 2. Data ───────────────────────────────────────────────────────────────
+    # 1. Processor
+    print("\n[1/4] Loading processor...")
+    processor = AutoProcessor.from_pretrained(config["model_name"])
+    # Tat image splitting de co consistent pixel_values shape cho batching
+    processor.image_processor.do_image_splitting = False
+    print(f"  vocab_size={processor.tokenizer.vocab_size}")
+    print(f"  pad_token_id={processor.tokenizer.pad_token_id}  "
+          f"eos_token_id={processor.tokenizer.eos_token_id}")
+
+    # 2. Data
     print("\n[2/4] Loading data...")
     df = pd.read_csv(config["train_file"])
     print(f"  {len(df)} samples | {df['language'].value_counts().to_dict()}")
@@ -222,60 +260,61 @@ def train():
     train_df, val_df = stratified_split(df, "language", config["val_split"])
     print(f"  Train: {len(train_df)} | Val: {len(val_df)}")
 
-    train_ds = PixelTextDataset(train_df, trocr_processor, mt5_tokenizer, config)
-    val_ds   = PixelTextDataset(val_df,   trocr_processor, mt5_tokenizer, config)
-    train_loader = DataLoader(train_ds, batch_size=config["batch_size"], shuffle=True,  num_workers=0, pin_memory=True)
-    val_loader   = DataLoader(val_ds,   batch_size=config["batch_size"], shuffle=False, num_workers=0, pin_memory=True)
+    train_ds = PixelTextDataset(train_df, processor, config, is_test=False)
+    val_ds   = PixelTextDataset(val_df,   processor, config, is_test=False)
+    train_loader = DataLoader(train_ds, batch_size=config["batch_size"],
+                              shuffle=True, num_workers=0, pin_memory=True,
+                              collate_fn=collate_fn)
+    val_loader   = DataLoader(val_ds, batch_size=config["batch_size"],
+                              shuffle=False, num_workers=0, pin_memory=True,
+                              collate_fn=collate_fn)
 
     # Sanity check
     s = train_ds[0]
-    true_ids = s["labels"][s["labels"] != -100]
-    print(f"\n  [SANITY] pixel_values={s['pixel_values'].shape}")
-    print(f"  [SANITY] target: '{mt5_tokenizer.decode(true_ids, skip_special_tokens=True)}'")
+    resp_ids = s["labels"][s["labels"] != -100]
+    print(f"\n  [SANITY] input_ids shape   = {s['input_ids'].shape}")
+    print(f"  [SANITY] pixel_values shape = {s['pixel_values'].shape}")
+    print(f"  [SANITY] response tokens   = {len(resp_ids)}")
+    print(f"  [SANITY] response text     = "
+          f"'{processor.tokenizer.decode(resp_ids, skip_special_tokens=True)[:80]}'")
 
-    # ── 3. Model ──────────────────────────────────────────────────────────────
+    # 3. Model
     print("\n[3/4] Building model...")
-    model = TrOCRmT5Model(config).to(device)
-    total     = sum(p.numel() for p in model.parameters())
-    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    enc_p     = sum(p.numel() for n, p in model.named_parameters() if "encoder" in n)
-    dec_p     = sum(p.numel() for n, p in model.named_parameters() if "decoder" in n or "lm_head" in n)
-    proj_p    = sum(p.numel() for n, p in model.named_parameters()
-                   if not any(k in n for k in ("encoder","decoder","lm_head")))
-    print(f"  Encoder:    {enc_p:>12,}")
-    print(f"  Decoder:    {dec_p:>12,}")
-    print(f"  Projection: {proj_p:>12,}")
-    print(f"  Total:      {total:>12,}  trainable={trainable:,}")
+    model = build_model(config, device)
 
     total_steps = len(train_loader) * config["epochs"]
     optimizer, scheduler = build_optimizer(model, config, total_steps)
 
-    # ── 4. Training loop ──────────────────────────────────────────────────────
-    print("\n[4/4] Training...")
+    # 4. Training loop
+    print(f"\n[4/4] Training ({total_steps} steps)...")
     best_cer   = float("inf")
     no_improve = 0
     history    = []
 
     for ep in range(1, config["epochs"] + 1):
-        print(f"\n── Epoch {ep}/{config['epochs']} ──")
+        print(f"\n{'='*50} Epoch {ep}/{config['epochs']} {'='*50}")
         t0 = time.time()
 
         tr_loss  = run_epoch(model, train_loader, optimizer, scheduler,
-                             scaler, config, device, "tr", train_mode=True)
-        val_loss = run_epoch(model, val_loader, None, None, None,
+                             config, device, "tr", train_mode=True)
+        val_loss = run_epoch(model, val_loader, None, None,
                              config, device, "val", train_mode=False)
-        metrics  = generation_metrics(model, val_df, val_ds, mt5_tokenizer,
-                                      config, device, n=config["eval_gen_samples"])
 
+        elapsed = time.time() - t0
         print(f"  train={tr_loss:.4f}  val={val_loss:.4f}  "
-              f"gap={val_loss-tr_loss:+.4f}  {time.time()-t0:.0f}s")
-        print(f"  memory_scale={model.memory_scale.item():.3f}")
+              f"gap={val_loss-tr_loss:+.4f}  {elapsed:.0f}s")
+
+        # Generation metrics (on raw val_df, not val_ds)
+        records = eval_generate(model, processor, val_df, config, device,
+                                n=config["eval_gen_samples"])
+        metrics = summarise_metrics(records)
         print_metrics(metrics)
 
-        rows = sample_preds(model, val_df, val_ds, mt5_tokenizer, config, device)
-        for lang, true, pred in rows:
-            print(f"    {lang}: TRUE={true[:80]}")
-            print(f"           PRED={pred[:80]}")
+        # Sample predictions
+        for r in records[:config["sample_pred_count"]]:
+            print(f"    [{r['lang']}]")
+            print(f"      TRUE: {r['true'][:80]}")
+            print(f"      PRED: {r['pred'][:80]}")
 
         history.append({
             "ep": ep, "tr": tr_loss, "val": val_loss,
@@ -284,30 +323,28 @@ def train():
         })
 
         # Save best
-        saved = should_save_best(metrics, best_cer, config)
-        if saved:
+        if should_save_best(metrics, best_cer, config):
             prev     = best_cer
             best_cer = metrics["cer_mean"]
-            best_dir = os.path.join(config["output_dir"], "best_model")
-            save(model, trocr_processor, mt5_tokenizer, config, best_dir)
-            improved   = (prev - best_cer) >= config["early_stop_min_delta"]
+            best_dir = os.path.join(config["output_dir"], "best_adapter")
+            save(model, processor, config, best_dir)
             no_improve = 0
-            print(f"  ★ Saved best → {best_dir}  (CER {prev:.4f} → {best_cer:.4f})")
+            print(f"  >>> Saved best -> {best_dir}  "
+                  f"(CER {prev:.4f} -> {best_cer:.4f})")
         else:
-            improved    = False
             no_improve += 1
 
         # Early stopping
         if (ep >= config["early_stop_warmup_epochs"]
                 and np.isfinite(best_cer)
                 and no_improve >= config["early_stop_patience"]):
-            print(f"  ⏹ Early stop: {no_improve} epochs không cải thiện.")
+            print(f"  EARLY STOP: {no_improve} epochs no improvement.")
             break
 
     # Save final
-    final_dir = os.path.join(config["output_dir"], "final_model")
-    save(model, trocr_processor, mt5_tokenizer, config, final_dir)
-    print(f"\n  Saved final → {final_dir}/")
+    final_dir = os.path.join(config["output_dir"], "final_adapter")
+    save(model, processor, config, final_dir)
+    print(f"\n  Saved final -> {final_dir}/")
 
     # Summary
     print(f"\n{'='*60}")
@@ -317,9 +354,9 @@ def train():
         print(f"  Best CER: {best_cer:.4f}")
     print(f"\n  {'Ep':>3}  {'Train':>8}  {'Val':>8}  {'CER':>7}  {'Short%':>7}")
     for h in history:
-        mk = " ★" if np.isfinite(best_cer) and abs(h["cer"] - best_cer) < 1e-6 else ""
+        mark = " *" if np.isfinite(best_cer) and abs(h["cer"] - best_cer) < 1e-6 else ""
         print(f"  {h['ep']:>3}  {h['tr']:>8.4f}  {h['val']:>8.4f}  "
-              f"{h['cer']:>7.3f}  {h['short']:>6.1f}%{mk}")
+              f"{h['cer']:>7.3f}  {h['short']:>6.1f}%{mark}")
     print("=" * 60)
 
 
