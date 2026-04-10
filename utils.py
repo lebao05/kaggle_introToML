@@ -1,119 +1,149 @@
-"""Render text -> image va convert image -> pixel coordinates.
-
-COMPLIANCE NOTE (assignment requirement):
-  - Context text NEVER enters the model as a text string.
-  - It is always rendered to a PIL image first (render_text_to_image).
-  - The model receives ONLY pixel_values (visual encoding), never input_ids of context.
-  - Prompts below describe the TASK FORMAT only; they do NOT repeat or encode context content.
-  - This ensures the model must perform visual understanding to solve the task,
-    not text-to-text completion.
-"""
-
 import os
-import sys
+import random
+from pathlib import Path
+
 import numpy as np
+import torch
 from PIL import Image, ImageDraw, ImageFont
 
 
-# ── Language-conditioned visual continuation prompts ──────────────────────────
-# Framing: "visual content that follows" — not "read text and complete it"
-# The model must look at the IMAGE to understand what's shown, not receive text.
 LANG_PROMPTS = {
-    "English": (
-        "The image shows the visual rendering of a passage. "
-        "Generate the continuation that would naturally follow "
-        "what is visually shown."
-    ),
-    "French": (
-        "L'image montre le rendu visuel d'un passage. "
-        "Générez la suite qui suivrait naturellement "
-        "ce qui est visuellement affiché."
-    ),
-    "German": (
-        "Das Bild zeigt die visuelle Darstellung eines Textes. "
-        "Generieren Sie die Fortsetzung, die natürlich auf "
-        "das visuell Gezeigte folgen würde."
-    ),
-    "Italian": (
-        "L'immagine mostra la rappresentazione visiva di un brano. "
-        "Genera la continuazione che seguirebbe naturalmente "
-        "ciò che è mostrato visivamente."
-    ),
-    "Spanish": (
-        "La imagen muestra la representación visual de un pasaje. "
-        "Genera la continuación que seguiría naturalmente "
-        "lo que se muestra visualmente."
-    ),
+    "English": "English: ",
+    "French": "French: ",
+    "German": "German: ",
+    "Italian": "Italian: ",
+    "Spanish": "Spanish: ",
 }
-DEFAULT_PROMPT = (
-    "The image shows the visual rendering of a passage. "
-    "Generate the continuation that would naturally follow "
-    "what is visually shown."
-)
 
 
-def get_lang_prompt(language: str) -> str:
-    """Task-format prompt only. Does NOT encode context content as text."""
-    return LANG_PROMPTS.get(language, DEFAULT_PROMPT)
+def set_seed(seed: int = 42) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
 
-def _get_font(font_size: int = 20) -> ImageFont.FreeTypeFont:
-    paths = (
-        ["C:/Windows/Fonts/times.ttf", "C:/Windows/Fonts/arial.ttf",
-         "/usr/share/fonts/truetype/liberation/LiberationSerif-Regular.ttf",
-         "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf"]
-        if os.name == "nt" else
-        ["/usr/share/fonts/truetype/liberation/LiberationSerif-Regular.ttf",
-         "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf",
-         "C:/Windows/Fonts/times.ttf", "C:/Windows/Fonts/arial.ttf"]
-    )
-    for p in paths:
-        if os.path.exists(p):
-            return ImageFont.truetype(p, font_size)
+def ensure_dir(path: str | os.PathLike) -> Path:
+    p = Path(path)
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def get_font(font_size: int = 18):
+    font_paths = [
+        "C:/Windows/Fonts/times.ttf",
+        "C:/Windows/Fonts/arial.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSerif-Regular.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf",
+    ]
+    for path in font_paths:
+        if os.path.exists(path):
+            return ImageFont.truetype(path, font_size)
     return ImageFont.load_default()
 
 
-def render_text_to_image(text: str, max_width: int,
-                         font_size: int = 18, padding: int = 12) -> Image.Image:
-    """Render text thanh anh grayscale (mode L), chu trang nen den, word-wrap."""
-    font = _get_font(font_size)
-    cw   = max_width - 2 * padding
+def render_text_to_image(text: str, max_width: int, font_size: int = 18, padding: int = 12) -> Image.Image:
+    text = str(text or "")
+    font = get_font(font_size)
+    content_width = max(16, int(max_width) - 2 * padding)
 
-    lines, cur = [], ""
+    lines = []
+    current = ""
     for word in text.split(" "):
-        test = f"{cur} {word}".strip()
-        bbox = font.getbbox(test)
-        if bbox[2] - bbox[0] <= cw:
-            cur = test
+        probe = f"{current} {word}".strip()
+        bbox = font.getbbox(probe)
+        if bbox[2] - bbox[0] <= content_width:
+            current = probe
         else:
-            if cur:
-                lines.append(cur)
-            cur = word
-    if cur:
-        lines.append(cur)
+            if current:
+                lines.append(current)
+            current = word
+    if current:
+        lines.append(current)
     if not lines:
         lines = ["."]
 
-    lh  = font_size + 4
-    img = Image.new("L", (max_width, len(lines) * lh + 2 * padding), 0)
+    line_h = font_size + 4
+    img = Image.new("L", (int(max_width), len(lines) * line_h + 2 * padding), 0)
     draw = ImageDraw.Draw(img)
     y = padding
     for line in lines:
         draw.text((padding, y), line, fill=255, font=font)
-        y += lh
+        y += line_h
     return img
 
 
-def image_to_pixels(img: Image.Image, sample_id: int,
-                    threshold: int = 127) -> np.ndarray:
-    """Chuyen PIL image -> pixel coordinates (sample_id, row, col)."""
+def fit_image_to_canvas(img: Image.Image, image_size: int, anchor: str = "bottom") -> Image.Image:
+    if img.mode != "RGB":
+        img = img.convert("RGB")
+    canvas = Image.new("RGB", (image_size, image_size), (0, 0, 0))
+    src = img
+
+    if src.size[0] > image_size:
+        src = src.crop((max(0, src.size[0] - image_size), 0, src.size[0], src.size[1]))
+    if src.size[1] > image_size:
+        if anchor == "bottom":
+            src = src.crop((0, src.size[1] - image_size, src.size[0], src.size[1]))
+        else:
+            src = src.crop((0, 0, src.size[0], image_size))
+
+    x = 0
+    if anchor == "bottom":
+        y = image_size - src.size[1]
+    else:
+        y = 0
+    canvas.paste(src, (x, y))
+    return canvas
+
+
+def white_pixel_density(img: Image.Image, threshold: int = 127) -> float:
+    arr = np.array(img.convert("L"))
+    return float((arr > threshold).mean())
+
+
+def image_to_pixels(img: Image.Image, sample_id: int, threshold: int = 127) -> np.ndarray:
     arr = np.array(img)
     rows, cols = np.where(arr > threshold)
     if len(rows) == 0:
-        print(f"[WARN] blank prediction sample_id={sample_id}", file=sys.stderr)
         return np.array([[sample_id, 0, 0]], dtype=np.int64)
-    return np.stack([
-        np.full(len(rows), sample_id, dtype=np.int64),
-        rows.astype(np.int64),
-        cols.astype(np.int64),
-    ], axis=1)
+    return np.stack(
+        [
+            np.full(len(rows), sample_id, dtype=np.int64),
+            rows.astype(np.int64),
+            cols.astype(np.int64),
+        ],
+        axis=1,
+    )
+
+
+def clean_text(text: str) -> str:
+    return " ".join((text or "").split()).strip()
+
+
+def get_language_prompt(language: str) -> str:
+    return LANG_PROMPTS.get(str(language), f"{language}: ")
+
+
+def tail_context(text: str, max_chars: int) -> str:
+    text = str(text or "")
+    if len(text) <= max_chars:
+        return text
+    return text[-max_chars:]
+
+
+def clean_prediction(text: str, language: str) -> str:
+    text = clean_text(text)
+    lower = text.lower()
+    for prompt in LANG_PROMPTS.values():
+        prefix = prompt.lower()
+        if lower.startswith(prefix):
+            text = clean_text(text[len(prompt) :])
+            lower = text.lower()
+    for prefix in ["answer:", "response:", "output:", "assistant:"]:
+        if lower.startswith(prefix):
+            text = clean_text(text[len(prefix) :])
+            lower = text.lower()
+    lang_prompt = get_language_prompt(language)
+    if text.startswith(lang_prompt):
+        text = clean_text(text[len(lang_prompt) :])
+    return text

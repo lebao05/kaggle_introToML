@@ -1,88 +1,70 @@
 from pathlib import Path
 
-LANG2ID = {"English": 0, "French": 1, "German": 2, "Italian": 3, "Spanish": 4}
-ID2LANG = {v: k for k, v in LANG2ID.items()}
+
+LANGUAGES = ["English", "French", "German", "Italian", "Spanish"]
 
 
-def get_config():
+def get_config() -> dict:
     root = Path(".")
     return {
-        # ── Model ─────────────────────────────────────────────────────────────
-        # SigLIP vision encoder (extracted from SmolVLM, pretrained, frozen).
-        # ONLY the pixel decoder is trained — no text tokens ever.
-        #
-        # COMPLIANCE:
-        #   Input  : context text rendered to PIL image → pixel_values (visual)
-        #   Process: SigLIP patch features → pooled visual embedding
-        #   Output : pixel decoder generates continuation image DIRECTLY
-        #            in pixel space — never passes through text token space.
-        "model_name": "HuggingFaceTB/SmolVLM-256M-Instruct",
-
-        # ── Data ──────────────────────────────────────────────────────────────
+        "seed": 42,
         "train_file": str(root / "train-3.csv"),
-        "test_file":  str(root / "test.csv"),
+        "test_file": str(root / "test.csv"),
         "output_dir": str(root / "outputs"),
-        "val_split":  0.10,
-
-        # ── Render (context image + target image use same params) ──────────────
+        "debug_dir": str(root / "debug_outputs"),
+        "model_name": "microsoft/trocr-base-printed",
         "font_size": 18,
-        "padding":   12,
-
-        # ── Pixel decoder output size ─────────────────────────────────────────
-        # Model generates a fixed (output_h × output_w) image.
-        # At inference the width is scaled to match each sample's max_width.
-        "output_h": 96,    # rows in predicted continuation image
-        "output_w": 384,   # columns (base width; scaled at inference)
-
-        # ── Pixel decoder architecture ────────────────────────────────────────
-        "lang_emb_dim":     32,   # language conditioning embedding size
-        "structure_hidden": 192,  # spatial channels before row decoding
-        "structure_grid_w": 96,   # intermediate width before final raster resize
-        "row_hidden":       256,  # GRU hidden size for row decoder
-        "row_layers":       2,
-        "col_hidden":       192,  # GRU hidden size for column decoder
-        "col_layers":       1,
-        "decoder_dropout":  0.15,
-
-        # ── Training ──────────────────────────────────────────────────────────
-        "epochs":       25,       # more epochs ok: decoder is small, low overfit risk
-        "batch_size":   8,        # larger batch fine without LM forward
-        "lr":           3e-4,
-        "weight_decay": 1e-4,
+        "padding": 12,
+        "image_size": 384,
+        "context_tail_chars": 160,
+        "freeze_encoder": True,
+        "decoder_tune_mode": "top_layers",
+        "decoder_train_layers": 4,
+        "val_split": 0.10,
+        "epochs": 10,
+        "batch_size": 4,
+        "grad_accum_steps": 2,
+        "lr": 1.0e-5,
+        "weight_decay": 0.01,
         "warmup_ratio": 0.10,
-        "grad_clip":    1.0,
-        "bf16":         True,
-
-        # BCE loss weight for positive (white) pixels.
-        # Text images are sparse: ~5-15% white pixels → upweight positives.
-        "pos_weight":   2.5,
-        "loss_bce_weight":       1.0,
-        "loss_dice_weight":      0.7,
-        "loss_density_weight":   0.3,
-        "loss_projection_weight": 0.4,
-        "best_density_penalty":   0.75,
-        "best_projection_penalty": 0.50,
-
-        # ── Eval & save ───────────────────────────────────────────────────────
-        "eval_samples":             30,   # samples used for pixel-F1 eval
-        "best_min_score":           0.0,  # save only if score > this
-        "early_stop_patience":      5,
-        "early_stop_warmup_epochs": 3,
-        "debug_image_count":        4,
-        "debug_threshold":          0.5,
+        "grad_clip": 1.0,
+        "bf16": True,
+        "max_target_length": 128,
+        "max_new_tokens": 72,
+        "min_new_tokens": 8,
+        "num_beams": 2,
+        "repetition_penalty": 1.20,
+        "no_repeat_ngram_size": 3,
+        "length_penalty": 0.8,
+        "prefix_token_count": 12,
+        "prefix_loss_weight": 3.0,
+        "debug_topk": 5,
+        "eval_samples": 24,
+        "debug_image_count": 4,
+        "log_interval": 20,
+        "early_stop_patience": 4,
+        "early_stop_warmup_epochs": 2,
     }
 
 
 def resolve_config(cfg: dict) -> dict:
     cfg = dict(cfg)
-    cfg["batch_size"] = int(max(1, cfg.get("batch_size", 8)))
-    cfg["epochs"]     = int(max(1, cfg.get("epochs", 25)))
-    cfg["output_h"]   = int(max(16, cfg.get("output_h", 96)))
-    cfg["output_w"]   = int(max(16, cfg.get("output_w", 384)))
-    cfg["structure_hidden"] = int(max(32, cfg.get("structure_hidden", 192)))
-    cfg["structure_grid_w"] = int(max(8, cfg.get("structure_grid_w", 96)))
-    cfg["row_hidden"] = int(max(32, cfg.get("row_hidden", 256)))
-    cfg["row_layers"] = int(max(1, cfg.get("row_layers", 2)))
-    cfg["col_hidden"] = int(max(32, cfg.get("col_hidden", 192)))
-    cfg["col_layers"] = int(max(1, cfg.get("col_layers", 1)))
+    cfg["epochs"] = int(max(1, cfg.get("epochs", 10)))
+    cfg["batch_size"] = int(max(1, cfg.get("batch_size", 4)))
+    cfg["grad_accum_steps"] = int(max(1, cfg.get("grad_accum_steps", 2)))
+    cfg["image_size"] = int(max(128, cfg.get("image_size", 384)))
+    cfg["context_tail_chars"] = int(max(32, cfg.get("context_tail_chars", 160)))
+    cfg["decoder_train_layers"] = int(max(1, cfg.get("decoder_train_layers", 4)))
+    cfg["max_target_length"] = int(max(16, cfg.get("max_target_length", 128)))
+    cfg["max_new_tokens"] = int(max(8, cfg.get("max_new_tokens", 72)))
+    cfg["min_new_tokens"] = int(max(0, min(cfg["max_new_tokens"] - 1, cfg.get("min_new_tokens", 8))))
+    cfg["num_beams"] = int(max(1, cfg.get("num_beams", 4)))
+    cfg["no_repeat_ngram_size"] = int(max(0, cfg.get("no_repeat_ngram_size", 3)))
+    cfg["prefix_token_count"] = int(max(1, cfg.get("prefix_token_count", 12)))
+    cfg["debug_topk"] = int(max(1, cfg.get("debug_topk", 5)))
+    cfg["eval_samples"] = int(max(1, cfg.get("eval_samples", 24)))
+    cfg["debug_image_count"] = int(max(1, cfg.get("debug_image_count", 4)))
+    cfg["log_interval"] = int(max(1, cfg.get("log_interval", 20)))
+    cfg["early_stop_patience"] = int(max(1, cfg.get("early_stop_patience", 4)))
+    cfg["early_stop_warmup_epochs"] = int(max(1, cfg.get("early_stop_warmup_epochs", 2)))
     return cfg
